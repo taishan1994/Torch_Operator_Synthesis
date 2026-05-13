@@ -67,10 +67,17 @@ def get_inputs():
 - torch.init 等初始化操作。
 
 # torch model生成
+可以使用任意的openai格式的接口，比如自己部署一个Qwen3-30B-A3B的模型：
+```shell
+model_path=/checkpoints/Qwen/Qwen3-30B-A3B-Instruct-2507
+port=11384
+vllm serve ${model_path} --host 0.0.0.0 --port ${port} --tensor-parallel-size 8 --gpu-memory-utilization 0.85 --enable-auto-tool-choice --tool-call-parser pythonic
+```
+
 ```shell
 python3 generate_cuda_agent_llm_data.py   \
---api-url http://192.168.11.18:30055/v1/chat/completions   \
---model MiniMax-M2.5   \
+--api-url http://192.168.11.18:11384/v1/chat/completions   \
+--model /checkpoints/Qwen/Qwen3-30B-A3B-Instruct-2507  \
 --meaningful-ops ops_catalog/meaningful_ops.csv   \
 --output-dir data/llm_cuda_agent_ops   \
 --count 6000   \
@@ -86,7 +93,7 @@ python3 generate_cuda_agent_llm_data.py   \
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `--api-url` | str | `http://192.168.11.18:30055/v1/chat/completions` | LLM API 端点地址 |
+| `--api-url` | str | `http://192.168.11.18:11384/v1/chat/completions` | LLM API 端点地址 |
 | `--api-key-env` | str | `MINIMAX_API_KEY` | 环境变量名，用于获取 API Key |
 | `--model` | str | `MiniMax-M2.5` | 使用的模型名称 |
 | `--meaningful-ops` | str | `ops_catalog/meaningful_ops.csv` | torch 操作目录 CSV 文件路径 |
