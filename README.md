@@ -1,4 +1,6 @@
 # Torch_Operator_Synthesis
+![alt text](ff23c903-b0e5-4206-a329-fff21f3e20bb.png)
+
 基于torch操作生成Model。目前kernel生成开源的数据比较少，我们可以通过torch model来合成cuda/triton数据，以供SFT/RL使用。
 
 目前调研到的一些数据：
