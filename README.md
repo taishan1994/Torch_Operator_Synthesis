@@ -200,3 +200,12 @@ python3 generate_cuda_agent_llm_data.py   \
   }
 }
 ```
+
+@misc{ChatSA,
+  author = {Oubo Gong},
+  title = {TOS: Torch Operator Synthesis},
+  year = {2026},
+  publisher = {GitHub},
+  journal = {GitHub repository},
+  url="https://github.com/taishan1994/Torch_Operator_Synthesis",
+}
