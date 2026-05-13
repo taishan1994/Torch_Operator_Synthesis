@@ -16,6 +16,7 @@
 - CudaAgent：Large-Scale Agentic RL for High-Performance CUDA Kernel Generation
 - DRKernel：Reinforcement Learning Done Right for Triton Kernel Generations
 - StitchCUDA：An Automated Multi-Agents End-to-End GPU Programing Framework with Rubric-based Agentic Reinforcement Learning
+- Kernel-Smith: A Unified Recipe for Evolutionary Kernel Optimization
 
 以及KernnelBench，使用的基础的torch Model格式为：
 ```python
