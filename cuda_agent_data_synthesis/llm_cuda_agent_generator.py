@@ -4,7 +4,6 @@ import argparse
 import ast
 import concurrent.futures
 import json
-import multiprocessing as mp
 import os
 import random
 import re
@@ -12,6 +11,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -19,30 +19,7 @@ from typing import Any
 import pandas as pd
 import torch
 
-
-def normalize_op(raw: str) -> str | None:
-    op = raw.strip().strip("`'\" ")
-    if not op:
-        return None
-    if op.startswith("torch.nn.modules."):
-        leaf = op.rsplit(".", maxsplit=1)[-1]
-        if hasattr(torch.nn, leaf):
-            return f"torch.nn.{leaf}"
-    if op.startswith("nn.modules."):
-        leaf = op.rsplit(".", maxsplit=1)[-1]
-        if hasattr(torch.nn, leaf):
-            return f"torch.nn.{leaf}"
-    if op.startswith("torch."):
-        return op
-    if op.startswith("nn."):
-        return "torch.nn." + op.removeprefix("nn.")
-    if op.startswith("F."):
-        return "torch.nn.functional." + op.removeprefix("F.")
-    if op.startswith("functional."):
-        return "torch.nn.functional." + op.removeprefix("functional.")
-    if op.startswith("transformers."):
-        return op
-    return op
+from .op_extractor import normalize_op
 
 
 CODE_BLOCK_RE = re.compile(r"```(?:python|py)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
@@ -69,6 +46,9 @@ class FilterConfig:
     atol: float
     rtol: float
     require_compile: bool
+    max_input_elements: int
+    max_output_elements: int
+    max_parameters: int
 
 
 def original_op_name(op: str) -> str:
@@ -408,6 +388,16 @@ def first_tensor(value: Any) -> torch.Tensor | None:
     return None
 
 
+def tensor_element_count(value: Any) -> int:
+    if torch.is_tensor(value):
+        return value.numel()
+    if isinstance(value, (list, tuple)):
+        return sum(tensor_element_count(item) for item in value)
+    if isinstance(value, dict):
+        return sum(tensor_element_count(item) for item in value.values())
+    return 0
+
+
 def outputs_allclose(a: Any, b: Any, atol: float, rtol: float) -> bool:
     if torch.is_tensor(a) and torch.is_tensor(b):
         return torch.allclose(a, b, atol=atol, rtol=rtol)
@@ -462,16 +452,36 @@ def validate_sample(code: str, cfg: FilterConfig) -> tuple[bool, dict[str, Any]]
         details["checks"]["no_cheating"] = True
         namespace: dict[str, Any] = {}
         exec(compile(code, "<llm_cuda_agent_sample>", "exec"), namespace)  # noqa: S102
-        model = namespace["Model"](*namespace["get_init_inputs"]()).to(cfg.device).eval()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            model = namespace["Model"](*namespace["get_init_inputs"]()).eval()
+        if caught:
+            details["warnings"] = [str(item.message) for item in caught[:10]]
+        parameter_count = sum(param.numel() for param in model.parameters())
+        details["parameter_count"] = parameter_count
+        if parameter_count > cfg.max_parameters:
+            details["reason"] = "too_many_parameters"
+            return False, details
+        model = model.to(cfg.device)
         details["checks"]["setup"] = True
         torch.manual_seed(1234)
         inputs1 = move_to_device(namespace["get_inputs"](), cfg.device)
         torch.manual_seed(5678)
         inputs2 = move_to_device(namespace["get_inputs"](), cfg.device)
+        input_elements = tensor_element_count(inputs1)
+        details["input_elements"] = input_elements
+        if input_elements > cfg.max_input_elements:
+            details["reason"] = "too_many_input_elements"
+            return False, details
         with torch.no_grad():
-            out1 = model(*inputs1)
-            out1_repeat = model(*inputs1)
-            out2 = model(*inputs2)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                out1 = model(*inputs1)
+                out1_repeat = model(*inputs1)
+                out2 = model(*inputs2)
+            if caught:
+                details.setdefault("warnings", [])
+                details["warnings"].extend(str(item.message) for item in caught[:10])
         details["checks"]["eager_forward"] = True
     except Exception as exc:  # noqa: BLE001
         details.update({"reason": f"execution_failed:{type(exc).__name__}", "error": str(exc)})
@@ -483,6 +493,11 @@ def validate_sample(code: str, cfg: FilterConfig) -> tuple[bool, dict[str, Any]]
         return False, details
     details["output_shape"] = list(tensor.shape)
     details["output_dtype"] = str(tensor.dtype)
+    output_elements = tensor_element_count(out1)
+    details["output_elements"] = output_elements
+    if output_elements > cfg.max_output_elements:
+        details["reason"] = "too_many_output_elements"
+        return False, details
     if not torch.isfinite(tensor).all().item():
         details["reason"] = "non_finite_output"
         return False, details
@@ -564,17 +579,74 @@ def load_existing(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def render_progress(accepted: int, target: int, attempts: int, rejected: int, started_at: float, last_reason: str) -> None:
+def count_jsonl(path: Path) -> int:
+    if not path.exists():
+        return 0
+    with path.open() as f:
+        return sum(1 for line in f if line.strip())
+
+
+def max_attempt_in_logs(paths: list[Path]) -> int:
+    max_attempt = 0
+    for path in paths:
+        if not path.exists():
+            continue
+        with path.open() as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    value = int(json.loads(line).get("attempt", 0))
+                except Exception:  # noqa: BLE001
+                    continue
+                max_attempt = max(max_attempt, value)
+    return max_attempt
+
+
+def advance_rng_for_completed_attempts(
+    rng: random.Random,
+    completed_attempts: int,
+    meaningful_ops: list[str],
+    args: argparse.Namespace,
+) -> None:
+    for _ in range(completed_attempts):
+        weighted_sample_ops(rng, meaningful_ops, args.min_ops, args.max_ops)
+
+
+def render_progress(
+    accepted: int,
+    target: int,
+    attempts: int,
+    rejected: int,
+    started_at: float,
+    last_reason: str,
+    last_timing: dict[str, Any] | None = None,
+    submitted: int | None = None,
+    in_flight: int = 0,
+) -> None:
     width = 32
     ratio = accepted / target if target else 1.0
     filled = min(width, int(width * ratio))
     bar = "#" * filled + "-" * (width - filled)
     elapsed = max(1e-6, time.time() - started_at)
     rate = accepted / elapsed
-    accept_rate = accepted / attempts if attempts else 0.0
+    decided = accepted + rejected
+    accept_rate = accepted / decided if decided else 0.0
+    timing = last_timing or {}
+    timing_text = ""
+    if timing:
+        timing_text = (
+            f" llm={float(timing.get('llm_s', 0.0)):.1f}s"
+            f" val={float(timing.get('validate_s', 0.0)):.1f}s"
+            f" round={float(timing.get('round_s', 0.0)):.1f}s"
+        )
+    submitted_text = ""
+    if submitted is not None and (submitted != attempts or in_flight):
+        submitted_text = f" submitted={submitted} in_flight={in_flight}"
     message = (
         f"\r[{bar}] {accepted}/{target} accepted | attempts={attempts} "
-        f"rejected={rejected} accept_rate={accept_rate:.1%} speed={rate:.2f}/s last={last_reason[:60]}"
+        f"rejected={rejected}{submitted_text} accept_rate={accept_rate:.1%} speed={rate:.2f}/s"
+        f"{timing_text} last={last_reason[:60]}"
     )
     sys.stderr.write(message)
     sys.stderr.flush()
@@ -588,6 +660,7 @@ def run_attempt(payload: dict[str, Any]) -> dict[str, Any]:
     available_ops = set(payload["available_ops"])
     repair_attempts = payload["repair_attempts"]
     raw_records: list[dict[str, Any]] = []
+    attempt_started = time.perf_counter()
 
     prompt = build_prompt(requested_ops, attempt)
     content_for_repair = ""
@@ -595,24 +668,37 @@ def run_attempt(payload: dict[str, Any]) -> dict[str, Any]:
     last_trace: dict[str, Any] | None = None
 
     for repair_round in range(repair_attempts + 1):
+        round_started = time.perf_counter()
+        timing: dict[str, Any] = {}
         try:
+            llm_started = time.perf_counter()
             if repair_round == 0:
                 content = call_chat_completion(llm_cfg, prompt)
             else:
                 repair_prompt = build_repair_prompt(requested_ops, content_for_repair, last_error, attempt)
                 content = call_chat_completion(llm_cfg, repair_prompt)
+            timing["llm_s"] = time.perf_counter() - llm_started
             content_for_repair = content
             raw_records.append(
                 {
                     "attempt": attempt,
                     "repair_round": repair_round,
                     "requested_ops": requested_ops,
+                    "timing": {**timing, "content_chars": len(content)},
                     "content": content,
                 }
             )
+            extract_started = time.perf_counter()
             code = extract_code_response(content)
+            timing["extract_s"] = time.perf_counter() - extract_started
+            timing["code_chars"] = len(code)
             record = normalize_record(code, requested_ops, available_ops)
+            validate_started = time.perf_counter()
             ok, details = validate_sample(record["code"], filter_cfg)
+            timing["validate_s"] = time.perf_counter() - validate_started
+            timing["round_s"] = time.perf_counter() - round_started
+            timing["attempt_s"] = time.perf_counter() - attempt_started
+            details["timing"] = timing
             trace = {
                 "attempt": attempt,
                 "repair_round": repair_round,
@@ -626,7 +712,10 @@ def run_attempt(payload: dict[str, Any]) -> dict[str, Any]:
             content_for_repair = record["code"]
             last_trace = trace
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
+            timing["round_s"] = time.perf_counter() - round_started
+            timing["attempt_s"] = time.perf_counter() - attempt_started
             last_error = {"reason": f"generation_failed:{type(exc).__name__}", "error": str(exc)}
+            last_error["timing"] = timing
             last_trace = {
                 "attempt": attempt,
                 "repair_round": repair_round,
@@ -684,6 +773,10 @@ def consume_attempt_result(
     return False, str(reason)
 
 
+def result_timing(result: dict[str, Any]) -> dict[str, Any]:
+    return result.get("trace", {}).get("filter", {}).get("timing", {})
+
+
 def run(args: argparse.Namespace) -> None:
     api_key = os.environ.get(args.api_key_env)
     if not api_key:
@@ -713,10 +806,18 @@ def run(args: argparse.Namespace) -> None:
         args.atol,
         args.rtol,
         args.require_compile,
+        args.max_input_elements,
+        args.max_output_elements,
+        args.max_parameters,
     )
 
-    attempts = 0
-    rejected_count = 0
+    # Resume from final attempt records only. raw_responses.jsonl is written once
+    # per repair round and can contain a higher, partially-consumed attempt if the
+    # process is killed between raw logging and accepted/rejected logging.
+    attempts = max_attempt_in_logs([accepted_path, rejected_path]) if args.resume else 0
+    if args.resume and attempts:
+        advance_rng_for_completed_attempts(rng, attempts, meaningful_ops, args)
+    rejected_count = count_jsonl(rejected_path) if args.resume else 0
     last_reason = "start"
     started_at = time.time()
     if args.workers <= 1:
@@ -728,18 +829,36 @@ def run(args: argparse.Namespace) -> None:
             if not ok:
                 rejected_count += 1
             if args.progress:
-                render_progress(len(accepted), args.count, attempts, rejected_count, started_at, last_reason)
+                render_progress(
+                    len(accepted),
+                    args.count,
+                    attempts,
+                    rejected_count,
+                    started_at,
+                    last_reason,
+                    result_timing(result),
+                )
             elif attempts % args.progress_every == 0:
                 print(f"attempts={attempts} accepted={len(accepted)} rejected={rejected_count} last={last_reason}")
     else:
-        ctx = mp.get_context("spawn")
-        with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers, mp_context=ctx) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
             futures: dict[concurrent.futures.Future[dict[str, Any]], int] = {}
             while len(accepted) < args.count and (attempts < args.max_attempts or futures):
                 while len(futures) < args.workers and attempts < args.max_attempts and len(accepted) < args.count:
                     attempts += 1
                     payload = next_attempt_payload(attempts, rng, meaningful_ops, available_ops, llm_cfg, filter_cfg, args)
-                    futures[executor.submit(run_attempt, payload)] = attempts
+                    try:
+                        futures[executor.submit(run_attempt, payload)] = attempts
+                    except Exception as exc:  # noqa: BLE001
+                        rejected_count += 1
+                        last_reason = f"submit_failed:{type(exc).__name__}"
+                        append_jsonl(
+                            rejected_path,
+                            {
+                                "attempt": attempts,
+                                "filter": {"reason": last_reason, "error": str(exc)},
+                            },
+                        )
                 if not futures:
                     break
                 done, _ = concurrent.futures.wait(
@@ -747,23 +866,37 @@ def run(args: argparse.Namespace) -> None:
                     return_when=concurrent.futures.FIRST_COMPLETED,
                 )
                 for future in done:
-                    futures.pop(future)
+                    attempt_id = futures.pop(future)
                     try:
                         result = future.result()
                     except Exception as exc:  # noqa: BLE001
                         result = {
                             "accepted": False,
-                            "trace": {"filter": {"reason": f"worker_failed:{type(exc).__name__}", "error": str(exc)}},
+                            "trace": {
+                                "attempt": attempt_id,
+                                "filter": {"reason": f"worker_failed:{type(exc).__name__}", "error": str(exc)},
+                            },
                             "raw_records": [],
                         }
                     ok, last_reason = consume_attempt_result(result, accepted, accepted_path, rejected_path, raw_path)
                     if not ok:
                         rejected_count += 1
+                    completed_attempts = len(accepted) + rejected_count
                     if args.progress:
-                        render_progress(len(accepted), args.count, attempts, rejected_count, started_at, last_reason)
-                    elif attempts % args.progress_every == 0:
+                        render_progress(
+                            len(accepted),
+                            args.count,
+                            completed_attempts,
+                            rejected_count,
+                            started_at,
+                            last_reason,
+                            result_timing(result),
+                            submitted=attempts,
+                            in_flight=len(futures),
+                        )
+                    elif completed_attempts % args.progress_every == 0:
                         print(
-                            f"attempts={attempts} accepted={len(accepted)} "
+                            f"attempts={completed_attempts} accepted={len(accepted)} "
                             f"rejected={rejected_count} last={last_reason}"
                         )
                     if len(accepted) >= args.count:
@@ -815,8 +948,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--atol", type=float, default=1e-2)
     parser.add_argument("--rtol", type=float, default=1e-2)
     parser.add_argument("--require-compile", action="store_true")
+    parser.add_argument("--max-input-elements", type=int, default=50_000_000)
+    parser.add_argument("--max-output-elements", type=int, default=50_000_000)
+    parser.add_argument("--max-parameters", type=int, default=100_000_000)
     parser.add_argument("--progress-every", type=int, default=10)
-    parser.add_argument("--workers", type=int, default=1, help="Number of worker processes for generation/validation.")
+    parser.add_argument("--workers", type=int, default=1, help="Number of concurrent worker threads for generation/validation.")
     parser.add_argument("--no-progress", dest="progress", action="store_false")
     parser.set_defaults(progress=True)
     parser.add_argument("--resume", action="store_true")
