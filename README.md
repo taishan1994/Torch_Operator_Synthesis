@@ -212,7 +212,7 @@ python3 generate_cuda_agent_llm_data.py   \
 ```
 
 ```
-@misc{ChatSA,
+@misc{TOS,
   author = {Oubo Gong},
   title = {TOS: Torch Operator Synthesis},
   year = {2026},
